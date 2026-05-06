@@ -1,13 +1,14 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getModel } from "@mariozechner/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, getModel } from "@mariozechner/pi-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DefaultResourceLoader } from "../src/core/resource-loader.js";
 import { createAgentSession } from "../src/core/sdk.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+import { createHarness } from "./suite/harness.js";
 
 describe("AgentSession dynamic tool registration", () => {
 	let tempDir: string;
@@ -89,6 +90,75 @@ describe("AgentSession dynamic tool registration", () => {
 		expect(session.systemPrompt).toContain("- Use dynamic_tool when the user asks for dynamic behavior tests.");
 
 		session.dispose();
+	});
+
+	it("syncs same-count tool replacements into the running agent loop context", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_start", () => {
+						pi.registerTool({
+							name: "dynamic_tool",
+							label: "Dynamic Tool",
+							description: "old dynamic description",
+							promptSnippet: "old dynamic prompt snippet",
+							parameters: Type.Object({}),
+							execute: async () => ({
+								content: [{ type: "text", text: "dynamic" }],
+								details: {},
+							}),
+						});
+						pi.registerTool({
+							name: "replace_dynamic_tool",
+							label: "Replace Dynamic Tool",
+							description: "Replace dynamic_tool without changing tool count",
+							promptSnippet: "replace dynamic tool",
+							parameters: Type.Object({}),
+							execute: async () => {
+								pi.registerTool({
+									name: "dynamic_tool",
+									label: "Dynamic Tool",
+									description: "new dynamic description",
+									promptSnippet: "new dynamic prompt snippet",
+									parameters: Type.Object({}),
+									execute: async () => ({
+										content: [{ type: "text", text: "dynamic" }],
+										details: {},
+									}),
+								});
+								return {
+									content: [{ type: "text", text: "replaced" }],
+									details: {},
+								};
+							},
+						});
+					});
+				},
+			],
+		});
+
+		try {
+			await harness.session.bindExtensions({});
+
+			let nextTurnDynamicDescription: string | undefined;
+			let nextTurnSystemPrompt = "";
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("replace_dynamic_tool", {}), { stopReason: "toolUse" }),
+				(context) => {
+					nextTurnDynamicDescription = context.tools?.find((tool) => tool.name === "dynamic_tool")?.description;
+					nextTurnSystemPrompt = context.systemPrompt ?? "";
+					return fauxAssistantMessage("done");
+				},
+			]);
+
+			await harness.session.prompt("replace the dynamic tool");
+
+			expect(nextTurnDynamicDescription).toBe("new dynamic description");
+			expect(nextTurnSystemPrompt).toContain("- dynamic_tool: new dynamic prompt snippet");
+			expect(nextTurnSystemPrompt).not.toContain("old dynamic prompt snippet");
+		} finally {
+			harness.cleanup();
+		}
 	});
 
 	it("returns source metadata for SDK custom tools", async () => {

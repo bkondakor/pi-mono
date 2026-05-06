@@ -17,6 +17,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import type {
 	Agent,
+	AgentContext,
 	AgentEvent,
 	AgentMessage,
 	AgentState,
@@ -176,6 +177,8 @@ export interface AgentSessionConfig {
 	sessionStartEvent?: SessionStartEvent;
 }
 
+type MutableAgentLoopContext = AgentContext & { agentSessionContextGeneration?: number };
+
 export interface ExtensionBindings {
 	uiContext?: ExtensionUIContext;
 	commandContextActions?: ExtensionCommandContextActions;
@@ -302,6 +305,7 @@ export class AgentSession {
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
+	private _agentLoopContextGeneration = 0;
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
 	private _toolPromptSnippets: Map<string, string> = new Map();
 	private _toolPromptGuidelines: Map<string, string[]> = new Map();
@@ -400,18 +404,7 @@ export class AgentSession {
 		};
 
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError, context }) => {
-			// Sync dynamically registered tools into the running agent loop context.
-			// When an extension calls pi.registerTool() during tool execution (e.g. MCP
-			// lazy-load), _refreshToolRegistry updates agent.state but the loop's context
-			// snapshot is stale. The agent-core passes context as a mutable reference, so
-			// patching it here makes new tools visible to subsequent turns in the same loop.
-			if (context) {
-				const liveTools = this.agent.state.tools;
-				if (liveTools.length !== context.tools?.length) {
-					context.tools = liveTools.slice();
-					context.systemPrompt = this.agent.state.systemPrompt;
-				}
-			}
+			this._syncAgentLoopContext(context);
 
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_result")) {
@@ -428,6 +421,8 @@ export class AgentSession {
 				isError,
 			});
 
+			this._syncAgentLoopContext(context);
+
 			if (!hookResult) {
 				return undefined;
 			}
@@ -438,6 +433,30 @@ export class AgentSession {
 				isError: hookResult.isError ?? isError,
 			};
 		};
+	}
+
+	private _markAgentLoopContextChanged(): void {
+		this._agentLoopContextGeneration++;
+	}
+
+	/**
+	 * Sync live AgentSession state into an already-running low-level agent loop.
+	 *
+	 * The agent loop receives a snapshot of tools and the system prompt at prompt
+	 * start. Extensions can register or replace tools while a tool is executing,
+	 * which updates agent.state but not that snapshot. The context object passed
+	 * to hooks is mutable, so syncing it here makes changes visible to the next
+	 * provider request in the same loop.
+	 */
+	private _syncAgentLoopContext(context: AgentContext): void {
+		const mutableContext = context as MutableAgentLoopContext;
+		if (mutableContext.agentSessionContextGeneration === this._agentLoopContextGeneration) {
+			return;
+		}
+
+		mutableContext.tools = this.agent.state.tools.slice();
+		mutableContext.systemPrompt = this.agent.state.systemPrompt;
+		mutableContext.agentSessionContextGeneration = this._agentLoopContextGeneration;
 	}
 
 	// =========================================================================
@@ -848,6 +867,7 @@ export class AgentSession {
 		// Rebuild base system prompt with new tool set
 		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames);
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
+		this._markAgentLoopContextChanged();
 	}
 
 	/** Whether compaction or branch summarization is currently running */
@@ -2087,6 +2107,7 @@ export class AgentSession {
 		this._resourceLoader.extendResources(extensionPaths);
 		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
+		this._markAgentLoopContextChanged();
 	}
 
 	private buildExtensionResourcePaths(entries: Array<{ path: string; extensionPath: string }>): Array<{
