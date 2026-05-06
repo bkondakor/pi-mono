@@ -161,6 +161,63 @@ describe("AgentSession dynamic tool registration", () => {
 		}
 	});
 
+	it("syncs newly added tools into the running agent loop context", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_start", () => {
+						pi.registerTool({
+							name: "register_new_tool",
+							label: "Register New Tool",
+							description: "Registers a brand-new tool during execution",
+							promptSnippet: "register new tool",
+							parameters: Type.Object({}),
+							execute: async () => {
+								pi.registerTool({
+									name: "freshly_added",
+									label: "Freshly Added",
+									description: "A tool that did not exist before",
+									promptSnippet: "freshly added tool",
+									parameters: Type.Object({}),
+									execute: async () => ({
+										content: [{ type: "text", text: "fresh" }],
+										details: {},
+									}),
+								});
+								return {
+									content: [{ type: "text", text: "registered" }],
+									details: {},
+								};
+							},
+						});
+					});
+				},
+			],
+		});
+
+		try {
+			await harness.session.bindExtensions({});
+
+			let nextTurnToolNames: string[] = [];
+			let nextTurnSystemPrompt = "";
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("register_new_tool", {}), { stopReason: "toolUse" }),
+				(context) => {
+					nextTurnToolNames = (context.tools ?? []).map((t) => t.name);
+					nextTurnSystemPrompt = context.systemPrompt ?? "";
+					return fauxAssistantMessage("done");
+				},
+			]);
+
+			await harness.session.prompt("register a new tool");
+
+			expect(nextTurnToolNames).toContain("freshly_added");
+			expect(nextTurnSystemPrompt).toContain("- freshly_added: freshly added tool");
+		} finally {
+			harness.cleanup();
+		}
+	});
+
 	it("returns source metadata for SDK custom tools", async () => {
 		const settingsManager = SettingsManager.create(tempDir, agentDir);
 		const sessionManager = SessionManager.inMemory();
